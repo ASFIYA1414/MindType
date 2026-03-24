@@ -1,0 +1,7 @@
+*.db
+*.pkl
+__pycache__/
+stress_model.pkl
+mindtype_dataset.csv
+public_training_dataset.csv
+keystrokes.db

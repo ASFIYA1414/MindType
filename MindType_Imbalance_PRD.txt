@@ -1,0 +1,162 @@
+MindType
+Keystroke Dynamics Stress Detection System
+Product Requirements Document — Class Imbalance Resolution
+
+
+Version	2.0
+Status	In Progress — Model Improvement Phase
+Date	April 2026
+Primary metric	Minority class F1  (stress detected)
+Current F1	0.70
+Target F1	>= 0.85
+Dataset shape	54,218 samples  |  6 columns
+Imbalance ratio	235:1  (52,437 non-stressed vs 223 stressed)
+Model (current)	RandomForestClassifier — basic, no class weighting
+Model (target)	XGBoost + SMOTE Pipeline + threshold tuning
+
+1. Problem Statement
+
+
+The current model achieves 1.00 overall accuracy — which sounds excellent but is entirely misleading. With 52,437 non-stressed samples against only 223 stressed samples, a classifier that predicts "no stress" on every single input would score 99.6% accuracy. The model has learned exactly this shortcut.
+
+WHY THIS IS DANGEROUS  Missing a stressed user is a false negative — the worst failure mode for a wellbeing detection product. The model currently misses 13 out of 45 stressed test samples. Every missed detection is a user who needed support but received none.
+
+1.1  Current model outputs
+Confusion matrix on test set (10,532 samples):
+
+	Predicted 0	Predicted 1
+Actual 0	10,472  ✓	15  FP
+Actual 1	13  FN	32  ✓
+
+2. Goals & Success Criteria
+
+
+2.1  Primary goal
+Raise the minority class (stress-detected) F1 score from 0.70 to >= 0.85 on held-out MindType data, without treating overall accuracy as a meaningful metric.
+
+2.2  Expected metric shift
+
+Metric	Current	Target (post-fix)
+Overall accuracy	1.00 (misleading)	0.88 – 0.93
+Minority precision	0.68	0.72 – 0.85
+Minority recall	0.71	0.80 – 0.90
+Minority F1	0.70	0.83 – 0.87
+PR-AUC	N/A	0.75 – 0.85
+False negatives	13	< 7 (target)
+
+NOTE ON ACCURACY DROP  An accuracy drop from 1.00 to 0.88-0.93 is expected and desirable. It means the model has stopped always predicting class 0 and is now doing its actual job. Do not flag this as a regression.
+
+2.3  Non-goals (out of scope for this phase)
+•Real-time inference latency optimisation
+•Multi-class stress levels (1–5 scale prediction)
+•Mobile or browser-based keystroke collection
+•Model deployment or serving infrastructure
+
+3. Data Balancing Techniques
+
+
+The following techniques address the 235:1 imbalance. The recommended approach is to combine SMOTE with cost-sensitive weighting rather than relying on either alone.
+
+Technique	How it works	Setting	Trade-off	Verdict
+SMOTE	Generates synthetic minority samples via interpolation	sampling_strategy=0.1 (1:10 target ratio)	Good recall lift; risk of noisy samples at extreme ratio	Recommended
+Class weights	Penalises misclassifying minority class during training	scale_pos_weight=235 in XGBoost	Zero data generated; fast; may underfit minority	Use alongside SMOTE
+ADASYN	Adaptive SMOTE — generates more samples near decision boundary	sampling_strategy=0.1	Better boundary coverage; computationally heavier	Try if SMOTE plateaus
+Undersampling	Removes majority class samples randomly	RandomUnderSampler(ratio=0.1)	Loses data; not recommended at 235:1 with only 223 minority	Avoid
+Threshold tuning	Lowers prediction threshold from 0.5 to optimum	Sweep 0.05–0.40 on predict_proba	Free performance gain; no retraining needed	Always do this
+
+3.1  Recommended combination
+Use SMOTE to bring the ratio from 235:1 down to 10:1, then set scale_pos_weight=10 to handle the residual imbalance. This avoids generating too many noisy synthetic samples while still giving the model a strong signal to learn minority patterns.
+
+from imblearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
+from xgboost import XGBClassifier
+
+pipe = Pipeline([
+    ('smote', SMOTE(sampling_strategy=0.1, random_state=42)),
+    ('model', XGBClassifier(
+        scale_pos_weight=10,
+        n_estimators=400,
+        max_depth=8,
+        learning_rate=0.1,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        eval_metric='logloss',
+        random_state=42
+    ))
+])
+
+CRITICAL  Always wrap SMOTE inside imblearn.pipeline.Pipeline when doing cross-validation. If you apply SMOTE to the full training set before CV, synthetic test-fold points leak into training and CV scores become falsely optimistic by a wide margin.
+
+4. Feature Engineering v2
+
+
+The current 5 features capture basic typing speed and hold patterns. The following additional features are specifically high-signal for cognitive load and stress detection from keystroke dynamics research.
+
+Feature	Formula	Why it helps
+IKI entropy	scipy.stats.entropy(np.histogram(pauses)[0])	Stressed typists have more irregular inter-key intervals — entropy captures this unpredictability
+Hold-time CV	std(holds) / mean(holds)	Normalises hold variance for typing speed; pure variance misleads fast vs slow typists
+Digraph latency	mean(t_release_key1 → t_press_key2) for common bigrams	Transition time between specific key pairs degrades under cognitive load
+Error burst rate	runs of >=2 consecutive backspaces / total keys	Stress causes clusters of corrections, not isolated typos
+Session KPM z-score	(window_kpm - user_mean_kpm) / user_std_kpm	Relative speed drop is more meaningful than absolute KPM
+
+5. Evaluation Strategy
+
+
+5.1  Metrics to report (mandatory)
+•Minority class F1  — primary metric
+•PR-AUC (precision-recall area under curve)  — best single number for imbalanced tasks
+•Minority precision and recall (separately)
+•Confusion matrix on held-out test set
+•Macro F1  — secondary overview metric
+•Optimal classification threshold (from PR curve)
+
+5.2  Metrics to STOP using
+REMOVE FROM REPORTS  Overall accuracy must be removed as a primary metric. It is meaningless at 235:1 imbalance and actively misleads evaluation. Any stakeholder report showing accuracy >= 99% for this task should be treated as incorrect.
+
+5.3  Threshold tuning
+The default 0.5 prediction threshold is calibrated for balanced datasets. At 235:1 imbalance it suppresses almost all class 1 predictions. After training, sweep thresholds and pick the one maximising minority F1:
+
+probs = model.predict_proba(X_test)[:, 1]
+best_t, best_f1 = 0.5, 0
+for t in np.arange(0.05, 0.50, 0.01):
+    f1 = f1_score(y_test, probs >= t)
+    if f1 > best_f1:
+        best_t, best_f1 = t, f1
+print(f'Optimal threshold: {best_t:.2f}, F1: {best_f1:.3f}')
+
+6. Implementation Steps
+
+
+Steps are ordered by impact. Fix evaluation first — otherwise improvements made in later steps are invisible.
+
+#	Action	Timeline	Details
+1	Fix evaluation metrics	Immediate	Replace accuracy with PR-AUC + minority F1 as primary metrics. Add confusion matrix, precision-recall curve plot. Mandatory before any model changes.
+2	SMOTE inside imblearn Pipeline	Week 1	Use imblearn.pipeline.Pipeline so SMOTE is applied per fold only. Set sampling_strategy=0.1 (target 1:10 ratio). Never apply SMOTE to full dataset before CV.
+3	Tune classification threshold	Week 1	Call predict_proba, sweep thresholds 0.05–0.40, pick threshold at peak minority F1. Default 0.5 is wrong for 235:1 imbalance.
+4	Feature engineering v2	Week 1	Add: IKI entropy, hold-time CV, digraph latency, error burst rate, session-normalised KPM z-score. All computed inside windowing loop.
+5	XGBoost + Optuna HPO	Week 2	Set scale_pos_weight=235. Run 50-trial Optuna study optimising minority F1. Tune: max_depth, learning_rate, subsample, colsample_bytree.
+6	Dataset distribution audit	Week 2	KS-test on avg_hold and kpm across public vs private datasets. Per-user z-score normalisation if distributions diverge significantly.
+7	Ensemble (if ceiling hit)	Week 3	Soft-vote XGBoost + CalibratedClassifier(RF) if single-model minority F1 remains below 0.83 after HPO.
+
+7. Risks & Mitigations
+
+
+Risk	Level	Impact	Mitigation
+SMOTE data leakage	High	Synthetic points from test fold contaminate training, inflating CV scores.	Always use imblearn.pipeline.Pipeline. Never fit SMOTE on full dataset before splitting.
+Over-sampling ratio	Medium	Going to 1:1 with 235x SMOTE generates poor-quality synthetic samples.	Target 1:10 ratio (sampling_strategy=0.1). Pair with scale_pos_weight for residual imbalance.
+Threshold at 0.5	High	Default threshold is severely biased toward majority class at 235:1 ratio.	Sweep predict_proba thresholds, pick peak-F1 threshold. Report precision@recall=0.80.
+Distribution shift	Medium	Public training data and private desktop data may have different typing distributions.	Run KS-test per feature before merge. Apply per-user z-score normalisation if p < 0.05.
+Overfitting minority	Low	Heavy class weighting can cause model to memorise the 223 real stress samples.	Monitor train vs val minority F1 gap. Use early_stopping_rounds in XGBoost.
+
+8. Files Requiring Changes
+
+
+File	Priority	Changes needed
+train_final_model.py	P1 — Critical	Replace RandomForest with XGBoost pipeline including SMOTE. Add scale_pos_weight. Save threshold alongside model in pkl.
+model_selection.py	P1 — Critical	Switch CV scorer to f1_score (minority). Add PR-AUC scoring. Add threshold sweep after best model selection.
+evaluate_mindtype.py	P1 — Critical	Replace accuracy print with full report: minority F1, PR-AUC, confusion matrix. Load saved threshold from pkl.
+extract_window_features.py	P2 — High	Add 5 new features: IKI entropy, hold CV, digraph latency, error burst rate, session KPM z-score.
+mbd_datasets/merge_datasets.py	P2 — High	Add KS-test per feature, assert no NaN post-merge, log per-dataset class distributions, stratified shuffle.
+
+
+This PRD was generated for the MindType keystroke dynamics stress detection project. All metric targets are based on the current dataset distribution (54,218 samples, 235:1 imbalance). Targets should be re-evaluated if dataset size or minority class ratio changes significantly.
